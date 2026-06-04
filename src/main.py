@@ -911,53 +911,45 @@ class ReplayBufferApp:
 
 def setup_autostart_and_shortcut():
     """יוצר קיצור דרך בשולחן העבודה ומוסיף להפעלה אוטומטית עם Windows"""
+    # רק כשרץ כ-EXE בנוי (לא בפיתוח)
+    if not getattr(sys, "frozen", False):
+        return
+
+    exe_path = Path(sys.executable)
+
+    # ── קיצור דרך בשולחן עבודה ──────────────────────────────────
     try:
-        exe_path = Path(sys.executable)
-        # כשבנוי כ-EXE עם PyInstaller, sys.executable הוא ה-EXE עצמו
-        if getattr(sys, "frozen", False):
-            exe_path = Path(sys.executable)
-        else:
-            return  # בפיתוח - לא מגדיר
+        import winreg as _wr
+        # מוצא את נתיב שולחן העבודה מה-Registry (עובד בכל שפה/משתמש)
+        with _wr.OpenKey(_wr.HKEY_CURRENT_USER,
+                         r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as k:
+            desktop = Path(_wr.QueryValueEx(k, "Desktop")[0])
 
-        # ── קיצור דרך בשולחן עבודה ──────────────────────────────
-        try:
-            import winshell
-            desktop = Path(winshell.desktop())
-            shortcut_path = desktop / "Replay Buffer.lnk"
-            if not shortcut_path.exists():
-                with winshell.shortcut(str(shortcut_path)) as sc:
-                    sc.path = str(exe_path)
-                    sc.description = "Replay Buffer - הקלטת מסך"
-                    sc.working_directory = str(exe_path.parent)
-        except ImportError:
-            # fallback ללא winshell - דרך PowerShell
-            desktop = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
-            shortcut_path = desktop / "Replay Buffer.lnk"
-            if not shortcut_path.exists():
-                ps_script = f"""
-$WshShell = New-Object -comObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("{shortcut_path}")
-$Shortcut.TargetPath = "{exe_path}"
-$Shortcut.WorkingDirectory = "{exe_path.parent}"
-$Shortcut.Description = "Replay Buffer"
-$Shortcut.Save()
-"""
-                subprocess.run(
-                    ["powershell", "-Command", ps_script],
-                    capture_output=True, timeout=10
-                )
+        shortcut_path = desktop / "Replay Buffer.lnk"
 
-        # ── הפעלה אוטומטית עם Windows (Registry) ────────────────
-        try:
-            import winreg
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path,
-                                0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "ReplayBuffer", 0,
-                                  winreg.REG_SZ, str(exe_path))
-        except Exception:
-            pass
+        if not shortcut_path.exists():
+            from win32com.client import Dispatch
+            import pythoncom
+            pythoncom.CoInitialize()
+            shell = Dispatch("WScript.Shell")
+            lnk = shell.CreateShortCut(str(shortcut_path))
+            lnk.TargetPath = str(exe_path)
+            lnk.WorkingDirectory = str(exe_path.parent)
+            lnk.IconLocation = str(exe_path)
+            lnk.Description = "Replay Buffer - הקלטת מסך"
+            lnk.WindowStyle = 1  # normal window
+            lnk.Save()
+    except Exception:
+        pass
 
+    # ── הפעלה אוטומטית עם Windows (Registry) ────────────────────
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path,
+                            0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "ReplayBuffer", 0,
+                              winreg.REG_SZ, f'"{exe_path}"')
     except Exception:
         pass
 
