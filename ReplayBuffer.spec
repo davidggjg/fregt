@@ -13,6 +13,7 @@ a = Analysis(
         'numpy',
         'sounddevice', 'soundfile',
         'cffi', '_cffi_backend',
+        'winshell', 'winreg',
         'tkinter', 'tkinter.ttk', 'tkinter.messagebox',
     ],
     hookspath=[],

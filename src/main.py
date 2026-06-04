@@ -909,6 +909,60 @@ class ReplayBufferApp:
         self.root.mainloop()
 
 
+def setup_autostart_and_shortcut():
+    """יוצר קיצור דרך בשולחן העבודה ומוסיף להפעלה אוטומטית עם Windows"""
+    try:
+        exe_path = Path(sys.executable)
+        # כשבנוי כ-EXE עם PyInstaller, sys.executable הוא ה-EXE עצמו
+        if getattr(sys, "frozen", False):
+            exe_path = Path(sys.executable)
+        else:
+            return  # בפיתוח - לא מגדיר
+
+        # ── קיצור דרך בשולחן עבודה ──────────────────────────────
+        try:
+            import winshell
+            desktop = Path(winshell.desktop())
+            shortcut_path = desktop / "Replay Buffer.lnk"
+            if not shortcut_path.exists():
+                with winshell.shortcut(str(shortcut_path)) as sc:
+                    sc.path = str(exe_path)
+                    sc.description = "Replay Buffer - הקלטת מסך"
+                    sc.working_directory = str(exe_path.parent)
+        except ImportError:
+            # fallback ללא winshell - דרך PowerShell
+            desktop = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+            shortcut_path = desktop / "Replay Buffer.lnk"
+            if not shortcut_path.exists():
+                ps_script = f"""
+$WshShell = New-Object -comObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("{shortcut_path}")
+$Shortcut.TargetPath = "{exe_path}"
+$Shortcut.WorkingDirectory = "{exe_path.parent}"
+$Shortcut.Description = "Replay Buffer"
+$Shortcut.Save()
+"""
+                subprocess.run(
+                    ["powershell", "-Command", ps_script],
+                    capture_output=True, timeout=10
+                )
+
+        # ── הפעלה אוטומטית עם Windows (Registry) ────────────────
+        try:
+            import winreg
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path,
+                                0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "ReplayBuffer", 0,
+                                  winreg.REG_SZ, str(exe_path))
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    setup_autostart_and_shortcut()
     app = ReplayBufferApp()
     app.run()
