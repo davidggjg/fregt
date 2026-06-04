@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout code
@@ -47,18 +49,8 @@ jobs:
           name: "ReplayBuffer v1.0.${{ github.run_number }}"
           body: |
             ## Replay Buffer - הורד והפעל
-
-            ### שימוש:
-            1. הורד את `ReplayBuffer.exe`
-            2. הפעל **כמנהל מערכת** (Run as Administrator)
-            3. בחר מקש שמירה (ברירת מחדל: F9)
-            4. הגדר כמה דקות לשמור
-            5. לחץ "התחל הקלטה"
-            6. כשיש רגע טוב במשחק - לחץ על המקש שבחרת!
-
-            ### הסברים:
-            - הסרטונים נשמרים ב: `Videos\ReplayBuffer`
-            - **דורש הרשאות מנהל** לתפיסת מקשים ומסך
+            הורד את ReplayBuffer.exe והפעל כמנהל מערכת.
+            הסרטונים נשמרים ב: Videos\ReplayBuffer
           files: dist/ReplayBuffer.exe
           draft: false
           prerelease: false
