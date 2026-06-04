@@ -20,6 +20,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install ffmpeg
+        run: |
+          choco install ffmpeg -y
+          ffmpeg -version
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -29,26 +34,32 @@ jobs:
         run: |
           pyinstaller ReplayBuffer.spec
 
-      - name: Upload EXE as artifact
+      - name: Bundle ffmpeg into dist
+        run: |
+          $ffmpegPath = (Get-Command ffmpeg).Source
+          Copy-Item $ffmpegPath dist\ffmpeg.exe
+
+      - name: Package into ZIP
+        run: |
+          Compress-Archive -Path dist\ReplayBuffer.exe, dist\ffmpeg.exe -DestinationPath dist\ReplayBuffer_full.zip
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ReplayBuffer-Windows
-          path: dist/ReplayBuffer.exe
+          path: dist\ReplayBuffer_full.zip
           retention-days: 30
 
       - name: Create Release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.${{ github.run_number }}
-          name: "ReplayBuffer v2.0.${{ github.run_number }}"
+          tag_name: v3.0.${{ github.run_number }}
+          name: "ReplayBuffer v3.0.${{ github.run_number }}"
           body: |
-            ## Replay Buffer v2 - הורד והפעל כמנהל מערכת
-            - מקליט buffer אוטומטי מרגע ההפעלה
-            - שמירה לא עוצרת את ההקלטה
-            - עורך וידאו עם פיצול קטעים ותצוגה מקדימה
-            - F11 למסך מלא בעורך
-          files: dist/ReplayBuffer.exe
+            הורד את ReplayBuffer_full.zip וחלץ את שני הקבצים לאותה תיקייה.
+            הפעל ReplayBuffer.exe כמנהל מערכת.
+          files: dist\ReplayBuffer_full.zip
           draft: false
           prerelease: false
         env:
