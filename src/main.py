@@ -11,8 +11,6 @@ import keyboard
 import mss
 import cv2
 import numpy as np
-import sounddevice as sd
-import soundfile as sf
 import subprocess
 import tempfile
 
@@ -42,70 +40,58 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-AUDIO_SAMPLERATE = 44100
-AUDIO_CHANNELS = 2
+def find_ffmpeg():
+    """מחפש ffmpeg: ליד ה-EXE קודם, אחר כך ב-PATH"""
+    if getattr(sys, "frozen", False):
+        local = Path(sys.executable).parent / "ffmpeg.exe"
+        if local.exists():
+            return str(local)
+    return "ffmpeg"
 
 
-def get_loopback_device():
-    """מחפש device של WASAPI loopback (סאונד מהמחשב)"""
+def list_dshow_audio_devices():
+    """מחזיר רשימת שמות של audio devices דרך ffmpeg dshow"""
+    ffmpeg = find_ffmpeg()
     try:
-        devices = sd.query_devices()
-        for i, d in enumerate(devices):
-            name = d["name"].lower()
-            if "loopback" in name or "stereo mix" in name or "what u hear" in name or "wave out" in name:
-                if d["max_input_channels"] > 0:
-                    return i
-        # fallback - default output as loopback
-        default_out = sd.query_devices(kind="output")
-        for i, d in enumerate(devices):
-            if d["name"] == default_out["name"] and d.get("hostapi") is not None:
-                hostapi = sd.query_hostapis(d["hostapi"])
-                if "wasapi" in hostapi["name"].lower():
-                    return i
-    except:
-        pass
+        result = subprocess.run(
+            [ffmpeg, "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+        output = result.stderr
+        devices = []
+        in_audio = False
+        for line in output.splitlines():
+            if "DirectShow audio devices" in line:
+                in_audio = True
+                continue
+            if "DirectShow video devices" in line:
+                in_audio = False
+                continue
+            if in_audio and '"' in line:
+                name = line.split('"')[1]
+                devices.append(name)
+        return devices
+    except Exception:
+        return []
+
+
+def find_stereo_mix_device():
+    """מחפש Stereo Mix / Virtual Audio Cable / CABLE Output בין dshow devices"""
+    devices = list_dshow_audio_devices()
+    priority = [
+        "stereo mix", "cable output", "virtual audio", "what u hear",
+        "wave out mix", "mixagem estéreo", "loopback"
+    ]
+    for keyword in priority:
+        for d in devices:
+            if keyword in d.lower():
+                return d
     return None
 
 
-def get_mic_device():
-    """מחפש את ה-default microphone"""
-    try:
-        return sd.query_devices(kind="input")["index"] if hasattr(
-            sd.query_devices(kind="input"), "index") else None
-    except:
-        return None
-
-
-class AudioCircularBuffer:
-    """Buffer מעגלי לאודיו (chunks של numpy)"""
-    def __init__(self, max_seconds, samplerate=AUDIO_SAMPLERATE, channels=AUDIO_CHANNELS):
-        self.max_chunks = int(max_seconds * samplerate / 1024) + 1
-        self.chunks = []
-        self.lock = threading.Lock()
-        self.samplerate = samplerate
-        self.channels = channels
-
-    def push(self, chunk):
-        with self.lock:
-            self.chunks.append(chunk.copy())
-            if len(self.chunks) > self.max_chunks:
-                self.chunks.pop(0)
-
-    def snapshot(self):
-        with self.lock:
-            if not self.chunks:
-                return None
-            return np.concatenate(self.chunks, axis=0)
-
-    def resize(self, max_seconds):
-        with self.lock:
-            self.max_chunks = int(max_seconds * self.samplerate / 1024) + 1
-            if len(self.chunks) > self.max_chunks:
-                self.chunks = self.chunks[-self.max_chunks:]
-
-
-class VideoCircularBuffer:
-    """Buffer מעגלי לוידאו"""
+class CircularBuffer:
+    """Buffer מעגלי לפריימי וידאו"""
     def __init__(self, max_frames):
         self.max_frames = max_frames
         self.frames = []
@@ -129,49 +115,44 @@ class VideoCircularBuffer:
 
 
 class CaptureEngine:
-    """מקליט וידאו + אודיו ברקע כל הזמן"""
+    """
+    מקליט וידאו (mss+opencv) + אודיו (ffmpeg dshow) ברקע כל הזמן.
+    אודיו: ffmpeg מקליט לקובץ rolling temp - כל X דקות מתחיל קובץ חדש.
+    """
     def __init__(self, config):
         self.config = config
         self._running = False
-        self._threads = []
-        self._init_buffers()
+        self._video_thread = None
+        self._audio_thread = None
+        self._audio_proc = None      # subprocess ffmpeg לאודיו
+        self._audio_file = None      # קובץ אודיו נוכחי
+        self._audio_lock = threading.Lock()
+        self._audio_start_time = None
+        self._init_video_buffer()
 
-    def _init_buffers(self):
+    def _init_video_buffer(self):
         fps = self.config["fps"]
         minutes = self.config["buffer_minutes"]
-        max_f = int(minutes * 60 * fps)
-        max_s = minutes * 60 + 10
-        self.video_buf = VideoCircularBuffer(max_f)
-        self.mic_buf = AudioCircularBuffer(max_s)
-        self.speaker_buf = AudioCircularBuffer(max_s)
+        self.video_buf = CircularBuffer(int(minutes * 60 * fps))
 
     def start(self):
         self._running = True
-        # וידאו
-        t_video = threading.Thread(target=self._video_loop, daemon=True)
-        t_video.start()
-        self._threads.append(t_video)
-        # מיקרופון
-        t_mic = threading.Thread(target=self._mic_loop, daemon=True)
-        t_mic.start()
-        self._threads.append(t_mic)
-        # סאונד מהמחשב (loopback)
-        t_spk = threading.Thread(target=self._speaker_loop, daemon=True)
-        t_spk.start()
-        self._threads.append(t_spk)
+        self._video_thread = threading.Thread(target=self._video_loop, daemon=True)
+        self._video_thread.start()
+        self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+        self._audio_thread.start()
 
     def stop(self):
         self._running = False
+        self._stop_audio_proc()
 
     def update_config(self, config):
         self.config = config
         fps = config["fps"]
         minutes = config["buffer_minutes"]
-        max_f = int(minutes * 60 * fps)
-        max_s = minutes * 60 + 10
-        self.video_buf.resize(max_f)
-        self.mic_buf.resize(max_s)
-        self.speaker_buf.resize(max_s)
+        self.video_buf.resize(int(minutes * 60 * fps))
+
+    # ── וידאו ────────────────────────────────────────────────────
 
     def _video_loop(self):
         fps = self.config["fps"]
@@ -189,62 +170,126 @@ class CaptureEngine:
                         scale = 1280 / w
                         frame = cv2.resize(frame, (1280, int(h * scale)))
                     self.video_buf.push(frame)
-                except:
+                except Exception:
                     pass
                 dt = time.time() - t0
                 wait = interval - dt
                 if wait > 0:
                     time.sleep(wait)
 
-    def _mic_loop(self):
-        """מקליט מיקרופון"""
+    # ── אודיו ────────────────────────────────────────────────────
+
+    def _audio_loop(self):
+        """מפעיל ffmpeg להקלטת אודיו - מתחדש כל buffer_minutes"""
+        while self._running:
+            self._start_audio_proc()
+            # ממתין עד שה-buffer מתמלא או שהפסקנו
+            minutes = self.config["buffer_minutes"]
+            deadline = time.time() + minutes * 60
+            while self._running and time.time() < deadline:
+                time.sleep(1)
+            # מפסיק את ffmpeg הנוכחי (שומר את הקובץ)
+            if self._running:
+                self._stop_audio_proc()
+
+    def _get_audio_tmp_path(self):
+        tmp = Path(tempfile.gettempdir()) / "ReplayBuffer"
+        tmp.mkdir(exist_ok=True)
+        return tmp / f"audio_{int(time.time())}.wav"
+
+    def _start_audio_proc(self):
+        """מפעיל ffmpeg process להקלטת אודיו"""
+        self._stop_audio_proc()
+        ffmpeg = find_ffmpeg()
+        out_path = self._get_audio_tmp_path()
+
+        # מחפש audio devices
+        stereo_mix = find_stereo_mix_device()
+        dshow_devices = list_dshow_audio_devices()
+        mic = next((d for d in dshow_devices
+                    if "mic" in d.lower() or "microphone" in d.lower()), None)
+
+        cmd = [ffmpeg, "-y"]
+
+        if stereo_mix and mic:
+            # מיקרופון + סאונד מהמחשב ביחד
+            cmd += [
+                "-f", "dshow", "-i", f"audio={stereo_mix}",
+                "-f", "dshow", "-i", f"audio={mic}",
+                "-filter_complex", "amix=inputs=2:duration=longest",
+                "-ac", "2", "-ar", "44100",
+                str(out_path)
+            ]
+        elif stereo_mix:
+            cmd += [
+                "-f", "dshow", "-i", f"audio={stereo_mix}",
+                "-ac", "2", "-ar", "44100",
+                str(out_path)
+            ]
+        elif mic:
+            cmd += [
+                "-f", "dshow", "-i", f"audio={mic}",
+                "-ac", "2", "-ar", "44100",
+                str(out_path)
+            ]
+        else:
+            # אין שום audio device - לא מקליט
+            return
+
         try:
-            def callback(indata, frames, time_info, status):
-                if self._running:
-                    self.mic_buf.push(indata)
-
-            with sd.InputStream(channels=1, samplerate=AUDIO_SAMPLERATE,
-                                blocksize=1024, callback=callback):
-                while self._running:
-                    time.sleep(0.1)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
+            )
+            with self._audio_lock:
+                self._audio_proc = proc
+                self._audio_file = out_path
+                self._audio_start_time = time.time()
         except Exception:
-            pass  # אם אין מיקרופון - ממשיך בלי
+            pass
 
-    def _speaker_loop(self):
-        """מקליט סאונד מהמחשב (WASAPI loopback)"""
-        try:
-            loopback_idx = get_loopback_device()
+    def _stop_audio_proc(self):
+        """עוצר ffmpeg בצורה נקייה (שולח 'q')"""
+        with self._audio_lock:
+            proc = self._audio_proc
+            self._audio_proc = None
+        if proc and proc.poll() is None:
+            try:
+                proc.stdin.write(b"q")
+                proc.stdin.flush()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
 
-            def callback(indata, frames, time_info, status):
-                if self._running:
-                    self.speaker_buf.push(indata)
+    def get_current_audio_file(self):
+        with self._audio_lock:
+            return self._audio_file, self._audio_start_time
 
-            kwargs = dict(channels=AUDIO_CHANNELS, samplerate=AUDIO_SAMPLERATE,
-                          blocksize=1024, callback=callback)
-            if loopback_idx is not None:
-                kwargs["device"] = loopback_idx
-
-            with sd.InputStream(**kwargs):
-                while self._running:
-                    time.sleep(0.1)
-        except Exception:
-            pass  # אם אין loopback - ממשיך בלי
+    # ── שמירה ────────────────────────────────────────────────────
 
     def save_snapshot(self, on_done):
         frames = self.video_buf.snapshot()
-        mic_audio = self.mic_buf.snapshot()
-        spk_audio = self.speaker_buf.snapshot()
         if not frames:
             return
+        audio_file, audio_start = self.get_current_audio_file()
+        save_time = time.time()
         threading.Thread(
             target=self._write,
-            args=(frames, mic_audio, spk_audio, on_done),
+            args=(frames, audio_file, audio_start, save_time, on_done),
             daemon=True
         ).start()
 
-    def _write(self, frames, mic_audio, spk_audio, on_done):
+    def _write(self, frames, audio_file, audio_start, save_time, on_done):
         SAVES_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        ffmpeg = find_ffmpeg()
 
         tmp_dir = Path(tempfile.mkdtemp())
         video_tmp = tmp_dir / "video_only.mp4"
@@ -253,88 +298,109 @@ class CaptureEngine:
         # כתיבת וידאו זמני
         h, w = frames[0].shape[:2]
         fps = self.config["fps"]
-        writer = cv2.VideoWriter(str(video_tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        writer = cv2.VideoWriter(str(video_tmp),
+                                 cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
         for f in frames:
             writer.write(f)
         writer.release()
 
-        # מיקס אודיו: מיקרופון (mono→stereo) + רמקולים
-        audio_tmp = None
+        # מיזוג עם אודיו
         try:
-            mixed = None
+            has_audio = (audio_file and Path(audio_file).exists()
+                         and Path(audio_file).stat().st_size > 1000)
 
-            if spk_audio is not None and len(spk_audio) > 0:
-                if spk_audio.ndim == 1:
-                    spk_audio = np.stack([spk_audio, spk_audio], axis=1)
-                elif spk_audio.shape[1] == 1:
-                    spk_audio = np.concatenate([spk_audio, spk_audio], axis=1)
-                mixed = spk_audio.astype(np.float32)
-
-            if mic_audio is not None and len(mic_audio) > 0:
-                if mic_audio.ndim == 1:
-                    mic_stereo = np.stack([mic_audio, mic_audio], axis=1)
-                elif mic_audio.shape[1] == 1:
-                    mic_stereo = np.concatenate([mic_audio, mic_audio], axis=1)
-                else:
-                    mic_stereo = mic_audio
-                mic_stereo = mic_stereo.astype(np.float32)
-                if mixed is not None:
-                    # חותך לאותו אורך
-                    min_len = min(len(mixed), len(mic_stereo))
-                    mixed = mixed[:min_len] + mic_stereo[:min_len]
-                else:
-                    mixed = mic_stereo
-
-            if mixed is not None:
-                # נרמול
-                peak = np.max(np.abs(mixed))
-                if peak > 0:
-                    mixed = mixed / peak * 0.9
-                audio_tmp = tmp_dir / "audio.wav"
-                sf.write(str(audio_tmp), mixed, AUDIO_SAMPLERATE)
-        except Exception:
-            audio_tmp = None
-
-        # מיזוג וידאו + אודיו עם ffmpeg
-        try:
-            # חיפוש ffmpeg: ליד ה-EXE → PATH
-            exe_dir = Path(sys.executable).parent
-            ffmpeg_local = exe_dir / "ffmpeg.exe"
-            ffmpeg_cmd = str(ffmpeg_local) if ffmpeg_local.exists() else "ffmpeg"
-
-            if audio_tmp and audio_tmp.exists():
+            if has_audio and audio_start:
+                # חותך אודיו לאותו אורך כמו הוידאו
+                video_duration = len(frames) / fps
+                audio_offset = max(0, (save_time - audio_start) - video_duration)
                 cmd = [
-                    ffmpeg_cmd, "-y",
+                    ffmpeg, "-y",
                     "-i", str(video_tmp),
-                    "-i", str(audio_tmp),
+                    "-ss", str(audio_offset),
+                    "-i", str(audio_file),
                     "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
+                    "-c:a", "aac", "-b:a", "192k",
                     "-shortest",
                     str(out_final)
                 ]
-                result = subprocess.run(cmd, capture_output=True, timeout=120)
-                if result.returncode != 0:
-                    # ffmpeg נכשל - שומר רק וידאו
-                    import shutil
-                    shutil.copy(str(video_tmp), str(out_final))
             else:
-                import shutil
-                shutil.copy(str(video_tmp), str(out_final))
+                cmd = [
+                    ffmpeg, "-y",
+                    "-i", str(video_tmp),
+                    "-c:v", "copy",
+                    str(out_final)
+                ]
+
+            subprocess.run(cmd, capture_output=True, timeout=120,
+                           creationflags=0x08000000)
         except Exception:
             import shutil
             try:
                 shutil.copy(str(video_tmp), str(out_final))
-            except:
+            except Exception:
                 pass
 
-        # ניקוי קבצים זמניים
+        # ניקוי
         try:
             video_tmp.unlink(missing_ok=True)
-            if audio_tmp:
-                audio_tmp.unlink(missing_ok=True)
             tmp_dir.rmdir()
-        except:
+        except Exception:
+            pass
+
+        if on_done:
+            on_done(str(out_final))
+
+    def _write(self, frames, audio_file, audio_start, save_time, on_done):
+        SAVES_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        ffmpeg = find_ffmpeg()
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        video_tmp = tmp_dir / "video_only.mp4"
+        out_final = SAVES_DIR / f"Replay_{ts}.mp4"
+
+        h, w = frames[0].shape[:2]
+        fps = self.config["fps"]
+        writer = cv2.VideoWriter(str(video_tmp),
+                                 cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        for f in frames:
+            writer.write(f)
+        writer.release()
+
+        try:
+            has_audio = (audio_file and Path(audio_file).exists()
+                         and Path(audio_file).stat().st_size > 1000)
+
+            if has_audio and audio_start:
+                video_duration = len(frames) / fps
+                audio_offset = max(0, (save_time - audio_start) - video_duration)
+                cmd = [
+                    ffmpeg, "-y",
+                    "-i", str(video_tmp),
+                    "-ss", str(audio_offset),
+                    "-i", str(audio_file),
+                    "-c:v", "copy",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-shortest",
+                    str(out_final)
+                ]
+            else:
+                cmd = [ffmpeg, "-y", "-i", str(video_tmp),
+                       "-c:v", "copy", str(out_final)]
+
+            subprocess.run(cmd, capture_output=True, timeout=120,
+                           creationflags=0x08000000)
+        except Exception:
+            import shutil
+            try:
+                shutil.copy(str(video_tmp), str(out_final))
+            except Exception:
+                pass
+
+        try:
+            video_tmp.unlink(missing_ok=True)
+            tmp_dir.rmdir()
+        except Exception:
             pass
 
         if on_done:

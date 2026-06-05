@@ -11,8 +11,6 @@ a = Analysis(
         'keyboard',
         'PIL', 'PIL.Image', 'PIL.ImageTk',
         'numpy',
-        'sounddevice', 'soundfile',
-        'cffi', '_cffi_backend',
         'win32com', 'win32com.client', 'win32com.shell',
         'pythoncom', 'pywintypes',
         'winreg',
