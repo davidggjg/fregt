@@ -11,14 +11,14 @@ a = Analysis(
         'keyboard',
         'PIL', 'PIL.Image', 'PIL.ImageTk',
         'numpy',
-        'win32com', 'win32com.client', 'win32com.shell',
+        'win32com', 'win32com.client',
         'pythoncom', 'pywintypes',
         'winreg',
         'tkinter', 'tkinter.ttk', 'tkinter.messagebox',
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=['matplotlib', 'scipy', 'pandas', 'PyQt5', 'wx'],
+    excludes=['matplotlib', 'scipy', 'pandas', 'PyQt5', 'wx', 'sounddevice', 'soundfile'],
     noarchive=False,
 )
 
