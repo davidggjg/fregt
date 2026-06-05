@@ -128,29 +128,46 @@ def has_nvenc():
 #    3. ffmpeg מתחיל קטע חדש → ממשיך להקליט
 #  אין כתיבת פריים-פריים → כל השמירה לוקחת 2-5 שניות.
 
-CHUNK_SECS = 30   # כל קטע 30 שניות
+CHUNK_SECS = 20   # כל קטע 20 שניות
+LOG_FILE = Path(tempfile.gettempdir()) / "ReplayBuffer_log.txt"
+
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 
 class CaptureEngine:
     def __init__(self, config):
         self.config = config
-        self._running   = False
-        self._proc      = None          # ffmpeg process נוכחי
-        self._proc_lock = threading.Lock()
-        self._chunks    = []            # [(path, start_time), ...]
+        self._running    = False
+        self._proc       = None
+        self._proc_lock  = threading.Lock()
+        self._chunks     = []   # [(path, start_time)]
         self._chunks_lock = threading.Lock()
         self._rec_thread = None
-        self._nvenc = has_nvenc() and config.get("use_nvenc", True)
-        # audio devices - נקבע פעם אחת
+        self._nvenc      = has_nvenc() and config.get("use_nvenc", True)
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        # מגלה devices פעם אחת בהתחלה
+        log("Detecting audio devices...")
         devs = ff_devices()
         self._loopback = pick_audio_device(devs["audio"])
         self._mic      = pick_mic_device(devs["audio"])
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        log(f"Loopback: {self._loopback} | Mic: {self._mic} | NVENC: {self._nvenc}")
+        log(f"All audio devices: {devs['audio']}")
 
     def start(self):
         self._running = True
+        # נקה קבצים ישנים
+        for f in TMP_DIR.glob("chunk_*.mp4"):
+            try: f.unlink()
+            except Exception: pass
         self._rec_thread = threading.Thread(target=self._record_loop, daemon=True)
         self._rec_thread.start()
+        log("CaptureEngine started")
 
     def stop(self):
         self._running = False
@@ -158,91 +175,86 @@ class CaptureEngine:
 
     def update_config(self, config):
         self.config = config
-        self._nvenc = has_nvenc() and config.get("use_nvenc", True)
 
     # ── הקלטת קטעים ──────────────────────────────────────────────
 
     def _record_loop(self):
-        """לולאה ראשית - מקליט קטעים אחד אחרי השני"""
         while self._running:
             chunk_path = TMP_DIR / f"chunk_{int(time.time())}.mp4"
             start_time = time.time()
+            log(f"Starting chunk: {chunk_path.name}")
             self._start_chunk(chunk_path)
-            # ממתין עד CHUNK_SECS
+
+            # ממתין עד CHUNK_SECS תוך בדיקה שה-process חי
             deadline = start_time + CHUNK_SECS
             while self._running and time.time() < deadline:
-                time.sleep(0.2)
+                time.sleep(0.5)
+                with self._proc_lock:
+                    proc = self._proc
+                if proc and proc.poll() is not None:
+                    log(f"ffmpeg exited early with code {proc.returncode}")
+                    break
+
             self._finish_chunk(chunk_path, start_time)
 
     def _build_ffmpeg_cmd(self, out_path):
-        """בונה את פקודת ffmpeg להקלטת קטע אחד"""
         ff = find_ffmpeg()
         fps = self.config["fps"]
+        n_audio = (1 if self._loopback else 0) + (1 if self._mic else 0)
         cmd = [ff, "-y"]
 
-        # ── אודיו inputs ──
-        if self._loopback and self._mic:
-            cmd += [
-                "-f", "dshow", "-i", f"audio={self._loopback}",
-                "-f", "dshow", "-i", f"audio={self._mic}",
-            ]
-        elif self._loopback:
+        # אודיו inputs
+        if self._loopback:
             cmd += ["-f", "dshow", "-i", f"audio={self._loopback}"]
-        elif self._mic:
+        if self._mic:
             cmd += ["-f", "dshow", "-i", f"audio={self._mic}"]
 
-        # ── וידאו input (gdigrab - ישיר ממנהל המסך של Windows) ──
-        cmd += [
-            "-f", "gdigrab",
-            "-framerate", str(fps),
-            "-i", "desktop",
-        ]
+        # וידאו - gdigrab
+        cmd += ["-f", "gdigrab", "-framerate", str(fps), "-i", "desktop"]
 
-        # ── audio filter (מיקס אם יש שניים) ──
-        n_audio = (1 if self._loopback else 0) + (1 if self._mic else 0)
+        # מיקס אודיו
         if n_audio == 2:
-            cmd += ["-filter_complex", "amix=inputs=2:duration=longest"]
-
-        # ── video encoder: NVENC > CPU ──
-        if self._nvenc:
-            cmd += [
-                "-c:v", "h264_nvenc",
-                "-preset", "p1",       # הכי מהיר
-                "-rc", "vbr",
-                "-b:v", "8M",
-            ]
+            # inputs: 0=loopback, 1=mic, 2=video
+            cmd += ["-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest[aout]",
+                    "-map", "2:v", "-map", "[aout]"]
+        elif n_audio == 1:
+            cmd += ["-map", "0:a", "-map", "1:v"]
         else:
-            cmd += [
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
-            ]
+            # רק וידאו
+            cmd += ["-map", "0:v"]
 
-        # ── audio encoder ──
+        # video encoder
+        if self._nvenc:
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-b:v", "8M"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+
+        # audio encoder
         if n_audio > 0:
             cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100"]
 
-        # ── מגביל ל-CHUNK_SECS ──
         cmd += ["-t", str(CHUNK_SECS), str(out_path)]
         return cmd
 
     def _start_chunk(self, out_path):
         cmd = self._build_ffmpeg_cmd(out_path)
+        log(f"ffmpeg cmd: {' '.join(cmd)}")
         try:
+            stderr_file = open(str(LOG_FILE) + ".stderr", "w")
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_file,
                 creationflags=NO_WINDOW
             )
             with self._proc_lock:
                 self._proc = proc
-        except Exception:
-            pass
+            log(f"ffmpeg PID: {proc.pid}")
+        except Exception as e:
+            log(f"Failed to start ffmpeg: {e}")
 
     def _finish_chunk(self, chunk_path, start_time):
-        """עוצר ffmpeg ומוסיף את הקטע לרשימה"""
         proc = None
         with self._proc_lock:
             proc = self._proc
@@ -252,7 +264,8 @@ class CaptureEngine:
             try:
                 proc.stdin.write(b"q")
                 proc.stdin.flush()
-                proc.wait(timeout=4)
+                proc.wait(timeout=5)
+                log(f"ffmpeg stopped cleanly, code={proc.returncode}")
             except Exception:
                 try:
                     proc.terminate()
@@ -260,23 +273,27 @@ class CaptureEngine:
                 except Exception:
                     pass
 
-        # מוסיף לרשימת קטעים אם הקובץ נוצר
-        if chunk_path.exists() and chunk_path.stat().st_size > 5000:
-            with self._chunks_lock:
-                self._chunks.append((chunk_path, start_time))
-                self._trim_old_chunks()
+        if chunk_path.exists():
+            size = chunk_path.stat().st_size
+            log(f"Chunk file size: {size} bytes")
+            if size > 5000:
+                with self._chunks_lock:
+                    self._chunks.append((chunk_path, start_time))
+                    self._trim_old_chunks()
+                log(f"Chunk added. Total chunks: {len(self._chunks)}")
+            else:
+                log(f"Chunk too small ({size}), discarded")
+        else:
+            log(f"Chunk file NOT created: {chunk_path}")
 
     def _trim_old_chunks(self):
-        """מוחק קטעים ישנים שחורגים מ-buffer_minutes"""
         keep_secs = self.config["buffer_minutes"] * 60 + CHUNK_SECS
         cutoff = time.time() - keep_secs
         to_delete = [(p, t) for p, t in self._chunks if t < cutoff]
         self._chunks = [(p, t) for p, t in self._chunks if t >= cutoff]
         for p, _ in to_delete:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
+            try: p.unlink(missing_ok=True)
+            except Exception: pass
 
     def _kill_proc(self):
         with self._proc_lock:
@@ -288,56 +305,54 @@ class CaptureEngine:
                 proc.stdin.flush()
                 proc.wait(timeout=4)
             except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                try: proc.terminate()
+                except Exception: pass
 
     # ── שמירה ─────────────────────────────────────────────────────
 
     def save_snapshot(self, on_done):
-        """
-        1. עוצר את הקטע הנוכחי
-        2. מחבר קטעים אחרונים → קובץ סופי
-        3. מתחיל קטע חדש
-        """
         def _do():
-            # שלב 1: סיים קטע נוכחי
+            log("=== SAVE SNAPSHOT ===")
             now = time.time()
-            current_chunk = TMP_DIR / f"chunk_{int(now)}_save.mp4"
+
+            # עצור process נוכחי
             proc = None
             with self._proc_lock:
                 proc = self._proc
                 self._proc = None
 
+            current_chunk = TMP_DIR / f"chunk_{int(now)}_cur.mp4"
+
             if proc and proc.poll() is None:
                 try:
                     proc.stdin.write(b"q")
                     proc.stdin.flush()
-                    proc.wait(timeout=4)
-                except Exception:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=2)
-                    except Exception:
-                        pass
+                    proc.wait(timeout=5)
+                    log(f"Current proc stopped, code={proc.returncode}")
+                except Exception as e:
+                    log(f"Error stopping proc: {e}")
+                    try: proc.terminate(); proc.wait(timeout=2)
+                    except Exception: pass
 
-            # מצא קובץ הקטע האחרון שנוצר
-            latest = max(TMP_DIR.glob("chunk_*.mp4"),
-                         key=lambda p: p.stat().st_mtime,
-                         default=None)
-            with self._chunks_lock:
-                if latest and latest not in [p for p, _ in self._chunks]:
-                    self._chunks.append((latest, now - CHUNK_SECS))
+            # מצא את הקובץ שנוצר עכשיו
+            all_chunks = sorted(TMP_DIR.glob("chunk_*.mp4"),
+                                key=lambda p: p.stat().st_mtime)
+            log(f"Chunk files found: {[p.name for p in all_chunks]}")
 
-            # שלב 2: concat קטעים
             with self._chunks_lock:
+                known = {p for p, _ in self._chunks}
+                for cp in all_chunks:
+                    if cp not in known and cp.stat().st_size > 5000:
+                        self._chunks.append((cp, now - cp.stat().st_size / 500000))
+                        log(f"Added missing chunk: {cp.name}")
                 self._trim_old_chunks()
                 chunks_to_use = list(self._chunks)
 
+            log(f"Chunks to concat: {len(chunks_to_use)}")
             out_path = self._concat_chunks(chunks_to_use)
+            log(f"Output: {out_path}")
 
-            # שלב 3: חזור להקלטה
+            # חזור להקלטה
             if self._running:
                 new_chunk = TMP_DIR / f"chunk_{int(time.time())}.mp4"
                 self._start_chunk(new_chunk)
@@ -348,8 +363,8 @@ class CaptureEngine:
         threading.Thread(target=_do, daemon=True).start()
 
     def _concat_chunks(self, chunks):
-        """מחבר קטעי mp4 לקובץ אחד - מהיר כי זה copy בלבד"""
         if not chunks:
+            log("No chunks to concat!")
             return None
 
         SAVES_DIR.mkdir(parents=True, exist_ok=True)
@@ -358,22 +373,24 @@ class CaptureEngine:
 
         if len(chunks) == 1:
             shutil.copy(str(chunks[0][0]), str(out))
+            log(f"Single chunk copied to {out}")
             return out
 
-        # כותב concat list
         concat_file = TMP_DIR / "concat.txt"
         with open(concat_file, "w") as f:
             for p, _ in chunks:
                 f.write(f"file '{p}'\n")
 
-        # ffmpeg concat demuxer - מהיר מאוד (stream copy)
-        run_ff(
+        result = run_ff(
             "-f", "concat", "-safe", "0",
             "-i", str(concat_file),
             "-c", "copy",
             str(out),
-            timeout=30
+            timeout=60
         )
+        log(f"Concat returncode: {result.returncode}")
+        if result.returncode != 0:
+            log(f"Concat stderr: {result.stderr.decode(errors='ignore')[-500:]}")
         return out if out.exists() else None
 
 
@@ -738,6 +755,11 @@ class ReplayBufferApp:
                   activebackground="#2a2a2a", relief="flat", pady=6,
                   cursor="hand2", command=self._open_folder).pack(fill="x", pady=(8, 0))
 
+        tk.Button(inner, text="🔍  פתח לוג",
+                  font=("Segoe UI", 9), bg="#1a1a1a", fg="#444444",
+                  activebackground="#2a2a2a", relief="flat", pady=6,
+                  cursor="hand2", command=self._open_log).pack(fill="x", pady=(4, 0))
+
         # ── Right panel ──
         right = tk.Frame(body, bg="#0a0a0a")
         right.pack(side="right", fill="both", expand=True, padx=16, pady=16)
@@ -862,6 +884,12 @@ class ReplayBufferApp:
                 self._refresh_saves_list()
             except Exception as e:
                 messagebox.showerror("שגיאה", str(e))
+
+    def _open_log(self):
+        if LOG_FILE.exists():
+            os.startfile(str(LOG_FILE))
+        else:
+            messagebox.showinfo("לוג", "אין לוג עדיין")
 
     def _open_folder(self):
         SAVES_DIR.mkdir(parents=True, exist_ok=True)
